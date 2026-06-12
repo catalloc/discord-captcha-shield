@@ -78,6 +78,7 @@ channel and grant the rest to the Verified role — see
 ```
 http.ts          # HTTP trigger — the multi-tenant router (set as HTTP val)
 cron.ts          # Cron trigger — daily cleanup + per-server OG card refresh
+kick-bots.ts     # Cron trigger — kick members who self-identified as bots (optional)
 mod.ts           # Verification logic + routing (Turnstile, OAuth, role grant, UI)
 admin.ts         # Guarded /admin API to register & manage servers at runtime
 guilds.ts        # Per-server config registry (CRUD over the captcha_guilds table)
@@ -310,6 +311,7 @@ optional; branding fields left unset fall back to `theme.ts`.
 | --- | --- | --- |
 | `guildId` | string | The Discord server ID (numeric) |
 | `roleId` | string | The Verified role ID to grant (numeric) |
+| `botRoleId` | string | Role given (via Onboarding) to self-identified bots; the `kick-bots.ts` cron kicks holders. Unset = off |
 | `serverName` | string | Display name on the portal + embeds |
 | `disabled` | boolean | When true, the portal/callback treat the server as unknown |
 | `brandName` | string | Branding name (defaults to `serverName`, then `theme.ts`) |
@@ -392,6 +394,33 @@ one.
 > `captcha_shield_v1_{guildId}_category` (one ID per key, so `setup.ts` can post
 > all four messages concurrently), plus `verify_og_png_v1_{guildId}` (the cached
 > social card).
+
+---
+
+## Bot self-identification trap (optional)
+
+A honeypot that catches scripted accounts before they ever reach the portal,
+using Discord **Onboarding** + the `kick-bots.ts` cron:
+
+1. In **Server Settings → Onboarding**, add a prejoin **question** like *"Are you
+   an automated account or a bot?"* with two answers:
+   - **"Yes"** → assign a **"Self-identified Bot"** role.
+   - **"No"** → assign your **Unverified** role (the one that reveals `#verify`).
+2. Register that bot role on the server: set **`botRoleId`** to its ID via the
+   admin API.
+3. Set **`kick-bots.ts`** as a second **Cron** val on a frequent schedule (e.g.
+   every 15 minutes, `*/15 * * * *`). It sweeps every server with a `botRoleId`
+   and **kicks** members still holding that role (a 5-minute grace skips
+   brand-new joins so a human who mis-clicked can re-do onboarding).
+
+Real humans read the question and pick "No"; naive bots/self-bots that auto-pick
+through Onboarding select themselves into the kick list.
+
+> **Extra requirements for this feature only:** the bot needs the
+> **GUILD_MEMBERS** privileged intent (Developer Portal → Bot → *Privileged
+> Gateway Intents*) so it can list members, and the **Kick Members** permission
+> in each server (add bit `0x2` to the invite `permissions`). The rest of the
+> shield never needs either.
 
 ---
 

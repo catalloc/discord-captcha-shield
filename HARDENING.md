@@ -48,6 +48,20 @@ Only two things meaningfully limit a joined-but-unverified user:
   gesture a determined bot can automate), so it isn't bot-proof on its own. Pair
   it with the CAPTCHA: screening blocks DMs, the CAPTCHA blocks bots.
 
+### B½. Onboarding bot-trap + kick cron (no gateway needed)
+- In **Server Settings → Onboarding**, add a prejoin **question** — *"Are you an
+  automated account or a bot?"* Answer **"Yes"** → assign a *Self-identified Bot*
+  role; answer **"No"** → assign your *Unverified* role (which reveals `#verify`).
+- Set the bot role as the server's **`botRoleId`** (admin API), and run
+  **`kick-bots.ts`** as a Cron val (e.g. `*/15 * * * *`). It sweeps every server
+  with a `botRoleId` and **kicks** holders of that role (a 5-min grace skips
+  brand-new joins). Humans pick "No"; scripts that auto-advance Onboarding pick
+  themselves into the kick list.
+- Unlike option C this needs **no always-on gateway** — it's a periodic REST
+  sweep. It does need the **GUILD_MEMBERS** privileged intent (to list members)
+  and the **Kick Members** permission. It complements, not replaces, screening:
+  it catches the naive-bot pattern, not a careful human-like bot.
+
 ### C. Gateway bot for join handling (quarantine + auto-kick)
 - React to `GUILD_MEMBER_ADD`: assign a **Quarantine** role (View denied
   everywhere except `#verify`) and auto-kick if unverified within N minutes.

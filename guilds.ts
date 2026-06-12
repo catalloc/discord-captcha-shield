@@ -30,6 +30,9 @@ import { ensureSchema, GUILDS_TABLE } from "./schema.ts";
 export interface GuildConfig {
   guildId: string;
   roleId: string;
+  /** Role assigned (via Discord Onboarding) to members who self-identify as a
+   *  bot. The kick-bots cron kicks anyone holding it. Unset = feature off. */
+  botRoleId?: string;
   serverName?: string;
   disabled: boolean;
 
@@ -79,6 +82,7 @@ export type GuildInput =
 const COLS = [
   "guild_id",
   "role_id",
+  "bot_role_id",
   "server_name",
   "disabled",
   "brand_name",
@@ -137,6 +141,7 @@ function rowToGuild(o: Record<string, unknown>): GuildConfig {
   return {
     guildId: String(o.guild_id),
     roleId: String(o.role_id),
+    botRoleId: str(o.bot_role_id),
     serverName: str(o.server_name),
     disabled: Number(o.disabled) === 1,
     brandName: str(o.brand_name),
@@ -201,6 +206,7 @@ export async function upsertGuild(input: GuildInput): Promise<void> {
   const data: Record<string, unknown> = {
     guild_id: input.guildId,
     role_id: input.roleId,
+    bot_role_id: input.botRoleId ?? null,
     server_name: input.serverName ?? null,
     disabled: input.disabled ? 1 : 0,
     brand_name: input.brandName ?? null,

@@ -42,10 +42,15 @@ export async function ensureSchema(): Promise<void> {
   if (schemaReady) return;
 
   // --- Per-server config + branding ---------------------------------------
+  // captcha_guilds is introduced in the multi-tenant branch and hasn't shipped,
+  // so its columns are authored in place here (no ALTER, no migration). Once
+  // this schema is RELEASED, follow the rename-not-ALTER rule above for any new
+  // column — bump to captcha_guilds_v2 and copy rows forward.
   await sqlite.execute(`
     CREATE TABLE IF NOT EXISTS ${GUILDS_TABLE} (
       guild_id              TEXT PRIMARY KEY,
       role_id               TEXT NOT NULL,
+      bot_role_id           TEXT,
       server_name           TEXT,
       disabled              INTEGER NOT NULL DEFAULT 0,
       brand_name            TEXT,

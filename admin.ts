@@ -153,6 +153,7 @@ function asAbout(v: unknown, key: string) {
 const FIELDS: Record<keyof GuildInput, (v: unknown, k: string) => unknown> = {
   guildId: asSnowflake,
   roleId: asSnowflake,
+  botRoleId: asSnowflake,
   serverName: asString,
   disabled: asBool,
   brandName: asString,
