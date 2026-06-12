@@ -1,0 +1,20 @@
+# Secrets — never commit these; set them as Val Town environment variables
+.env
+.env.local
+*.key
+*.pem
+secrets.json
+
+# Val Town local state
+.vt/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.Identifier
+
+# Deno / Node
+node_modules/
+vendor/
+deno.lock
