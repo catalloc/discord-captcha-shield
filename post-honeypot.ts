@@ -2,30 +2,27 @@
 // Post the honeypot warning into Discord (manual trigger)
 // ============================================================================
 //
-// Run this file (Val Town "Run" button) and the bot posts a small "do not post
-// here" embed into DISCORD_HONEYPOT_CHANNEL_ID, pointing legit users to the
-// verify channel (and rules). The honeypot is a trap: bots that auto-spam every
-// channel post here and out themselves — pair it with an AutoMod rule or manual
-// review to ban anyone who posts.
+// Run this file and the bot posts a small "do not post here" embed into the
+// server's honeypot channel, pointing legit users to the verify channel (and
+// rules). The honeypot is a trap: bots that auto-spam every channel post here
+// and out themselves — pair it with an AutoMod rule or manual review to ban
+// anyone who posts.
 //
-// Requires: DISCORD_BOT_TOKEN, DISCORD_HONEYPOT_CHANNEL_ID. Uses
-// DISCORD_VERIFY_CHANNEL_ID and DISCORD_RULES_CHANNEL_ID for the in-embed links
-// (numeric ID, channel link, or #mention all accepted). Optional:
-// VERIFY_SERVER_NAME. Bot needs Send Messages + Embed Links in that channel.
+// Which server: pass the guild id as the first CLI argument, or set
+// TOOL_GUILD_ID / DISCORD_GUILD_ID. The honeypot/verify/rules channels and
+// branding come from the registered server's config; the bot token is shared
+// env. The bot needs Send Messages + Embed Links in that channel.
 // ============================================================================
 
-import { postHoneypotMessage, type VerifyConfig } from "./mod.ts";
-import { env, optEnv } from "./config.ts";
+import { postHoneypotMessage } from "./mod.ts";
+import { loadGuildToolConfig, toolGuildId } from "./config.ts";
 
-export async function main() {
-  const config = {
-    botToken: env("DISCORD_BOT_TOKEN"),
-    serverName: optEnv("VERIFY_SERVER_NAME"),
-    honeypotChannelId: optEnv("DISCORD_HONEYPOT_CHANNEL_ID"),
-    verifyChannelId: optEnv("DISCORD_VERIFY_CHANNEL_ID"),
-    rulesChannelId: optEnv("DISCORD_RULES_CHANNEL_ID"),
-  } as VerifyConfig;
-
+export async function main(guildId: string = toolGuildId()) {
+  const config = await loadGuildToolConfig(guildId);
+  if (!config) {
+    console.error(`Server ${guildId} isn't registered (POST /admin/guilds first).`);
+    return;
+  }
   const result = await postHoneypotMessage(config);
   console.log(
     result.ok

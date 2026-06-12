@@ -2,20 +2,21 @@
 // One-shot DMZ bootstrap (manual trigger)
 // ============================================================================
 //
-// Run this file ONCE (Val Town "Run" button) to stand up the whole DMZ:
+// Run this file to stand up the whole DMZ for ONE server:
 //   1. Creates a "Welcome" category + #about, #rules, #verify, #do-not-post
 //      channels with read-only @everyone overwrites (the honeypot stays open).
 //   2. Posts the about / rules / verify / honeypot messages into them.
-// Every channel + message ID is saved to blob storage, so re-running any
-// post-*.ts afterwards EDITS its message in place instead of duplicating, and
-// re-running setup.ts skips channels that already exist.
+// Every channel + message ID is saved to blob storage (namespaced per guild),
+// so re-running any post-*.ts afterwards EDITS its message in place instead of
+// duplicating, and re-running setup.ts skips channels that already exist.
 //
-// Requires: DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, DISCORD_CLIENT_ID, and the bot
-// must have **Manage Channels** (plus the usual Send Messages + Embed Links).
-// Optional: VERIFY_SERVER_NAME, VERIFY_PORTAL_URL (adds the Verify buttons).
+// Which server: pass the guild id as the first CLI argument, or set
+// TOOL_GUILD_ID / DISCORD_GUILD_ID. The server must already be registered (via
+// the admin API or the legacy env seed); its role + branding come from there.
 //
-// Already have channels? Skip this — set the DISCORD_*_CHANNEL_ID env vars and
-// run the individual post-*.ts scripts instead.
+// Requires the shared DISCORD_BOT_TOKEN + DISCORD_CLIENT_ID, and the bot must
+// have **Manage Channels** (plus the usual Send Messages + Embed Links). Set
+// the server's portalUrl (admin API) to add the Verify buttons.
 // ============================================================================
 
 import { createDmzChannels } from "./channels.ts";
@@ -26,18 +27,18 @@ import {
   postVerifyMessage,
   type VerifyConfig,
 } from "./mod.ts";
-import { env, optEnv } from "./config.ts";
+import { loadGuildToolConfig, toolGuildId } from "./config.ts";
 
-export async function main() {
-  const redirect = optEnv("VERIFY_REDIRECT_URI");
-  const config = {
-    botToken: env("DISCORD_BOT_TOKEN"),
-    guildId: env("DISCORD_GUILD_ID"),
-    clientId: env("DISCORD_CLIENT_ID"),
-    serverName: optEnv("VERIFY_SERVER_NAME"),
-    portalUrl: optEnv("VERIFY_PORTAL_URL") ??
-      (redirect ? redirect.replace(/\/callback$/, "") : undefined),
-  } as VerifyConfig;
+export async function main(guildId: string = toolGuildId()) {
+  const config = await loadGuildToolConfig(guildId);
+  if (!config) {
+    console.error(
+      `Server ${guildId} isn't registered. Add it via the admin API first ` +
+        `(POST /admin/guilds), then re-run setup.`,
+    );
+    return;
+  }
+  console.log(`Setting up DMZ for server ${guildId}…`);
 
   console.log("Creating DMZ channels…");
   for (const r of await createDmzChannels(config)) {

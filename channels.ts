@@ -119,7 +119,7 @@ async function ensureCategory(
   config: VerifyConfig,
   results: CreateResult[],
 ): Promise<string> {
-  const existing = await getCategory();
+  const existing = await getCategory(config.guildId);
   if (existing && await channelExists(config, existing)) {
     results.push({
       kind: "category",
@@ -145,7 +145,7 @@ async function ensureCategory(
     return "";
   }
   const created = await res.json();
-  await rememberCategory(created.id);
+  await rememberCategory(config.guildId, created.id);
   results.push({
     kind: "category",
     name: CATEGORY_NAME,
@@ -161,7 +161,7 @@ async function ensureChannel(
   spec: ChannelSpec,
   parentId: string,
 ): Promise<CreateResult> {
-  const existingId = await getChannel(spec.kind);
+  const existingId = await getChannel(config.guildId, spec.kind);
   if (existingId && await channelExists(config, existingId)) {
     return { kind: spec.kind, name: spec.name, status: "exists", id: existingId };
   }
@@ -188,7 +188,7 @@ async function ensureChannel(
     };
   }
   const created = await res.json();
-  await rememberChannel(spec.kind, created.id);
+  await rememberChannel(config.guildId, spec.kind, created.id);
   return { kind: spec.kind, name: spec.name, status: "created", id: created.id };
 }
 

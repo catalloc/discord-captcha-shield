@@ -110,19 +110,85 @@ export const about: AboutInfo = {
 };
 
 // ========================================
+// THEME RESOLUTION (per-server white-label)
+// ========================================
+
+/**
+ * A fully-resolved theme: every visual value the portal, OG card, and embeds
+ * need, with no undefined fields. Built by resolveTheme() from a server's
+ * overrides layered over the brand defaults above.
+ */
+export interface ResolvedTheme {
+  name: string;
+  ogHeadline: string;
+  ogTagline: string;
+  logoUrl: string;
+  accentColor: string;
+  accentColorBright: string;
+  embedColor: number;
+  ogFallbackImage: string;
+  rules: Rule[];
+  about: AboutInfo;
+}
+
+/** Per-server branding overrides. Any field left undefined falls back to the
+ *  brand defaults in this file. Sourced from a guild's stored config row. */
+export interface ThemeOverrides {
+  serverName?: string;
+  brandName?: string;
+  logoUrl?: string;
+  accentColor?: string;
+  accentColorBright?: string;
+  embedColor?: number;
+  ogHeadline?: string;
+  ogTagline?: string;
+  ogFallbackImage?: string;
+  rules?: Rule[];
+  about?: AboutInfo;
+}
+
+/** Merge per-server overrides over the brand defaults into a ResolvedTheme. */
+export function resolveTheme(o: ThemeOverrides = {}): ResolvedTheme {
+  return {
+    name: o.serverName ?? o.brandName ?? brand.name,
+    ogHeadline: o.ogHeadline ?? brand.ogHeadline,
+    ogTagline: o.ogTagline ?? brand.ogTagline,
+    logoUrl: o.logoUrl ?? brand.logoUrl,
+    accentColor: o.accentColor ?? brand.accentColor,
+    accentColorBright: o.accentColorBright ?? brand.accentColorBright,
+    embedColor: o.embedColor ?? brand.embedColor,
+    ogFallbackImage: o.ogFallbackImage ?? brand.ogFallbackImage,
+    rules: o.rules ?? rules,
+    about: o.about ?? about,
+  };
+}
+
+/** "#F4A340" -> "244,163,64" for use in rgba(var(--accent-rgb), a). Falls back
+ *  to the brand tabby orange if the hex can't be parsed. */
+function hexToRgb(hex: string): string {
+  const h = hex.replace("#", "").trim();
+  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+  const n = parseInt(full, 16);
+  if (full.length !== 6 || Number.isNaN(n)) return "244,163,64";
+  return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+}
+
+// ========================================
 // STYLES (replaces core/styles.tsx getAllStyles)
 // ========================================
 
 /**
- * All CSS the portal needs, self-contained. Maps the brand accent onto theme
- * variables and ships the small `.btn` + portal layout the page references.
- * Soft, rounded, cat-friendly — no external stylesheet required.
+ * All CSS the portal needs, self-contained. Maps the resolved theme's accent
+ * onto CSS variables (including an --accent-rgb triple so translucent accents
+ * re-skin per server) and ships the small `.btn` + portal layout the page
+ * references. Soft, rounded — no external stylesheet required.
  */
-export function portalCss(): string {
+export function portalCss(theme: ResolvedTheme): string {
   return `
   :root {
-    --accent: ${brand.accentColor};
-    --accent-bright: ${brand.accentColorBright};
+    --accent: ${theme.accentColor};
+    --accent-bright: ${theme.accentColorBright};
+    --accent-rgb: ${hexToRgb(theme.accentColor)};
     --bg: #0E0D0B;
     --surface: #1C1A17;
     --surface-2: #2A2722;
@@ -157,7 +223,7 @@ export function portalCss(): string {
   }
   .btn-primary:hover {
     transform: translateY(-2px);
-    box-shadow: 0 10px 28px rgba(244,163,64,0.35);
+    box-shadow: 0 10px 28px rgba(var(--accent-rgb),0.35);
   }
   .btn-secondary {
     background: transparent;
@@ -165,7 +231,7 @@ export function portalCss(): string {
     border: 2px solid var(--accent);
   }
   .btn-secondary:hover {
-    background: rgba(244,163,64,0.12);
+    background: rgba(var(--accent-rgb),0.12);
     transform: translateY(-2px);
   }
 
@@ -176,14 +242,14 @@ export function portalCss(): string {
     justify-content: center;
     padding: 24px;
     background:
-      radial-gradient(ellipse at 50% 0%, rgba(244,163,64,0.16) 0%, transparent 60%),
+      radial-gradient(ellipse at 50% 0%, rgba(var(--accent-rgb),0.16) 0%, transparent 60%),
       linear-gradient(160deg, #0E0D0B 0%, #15120E 60%, #0E0D0B 100%);
   }
   .verify-card {
     width: 100%;
     max-width: 440px;
     background: linear-gradient(150deg, var(--surface-2), var(--surface));
-    border: 1px solid rgba(244,163,64,0.22);
+    border: 1px solid rgba(var(--accent-rgb),0.22);
     padding: 2.5rem 2rem;
     position: relative;
     overflow: hidden;
@@ -204,8 +270,8 @@ export function portalCss(): string {
     object-fit: cover;
     border-radius: 50%;
     margin: 0 auto 1.25rem;
-    border: 3px solid rgba(244,163,64,0.5);
-    box-shadow: 0 0 26px rgba(244,163,64,0.4);
+    border: 3px solid rgba(var(--accent-rgb),0.5);
+    box-shadow: 0 0 26px rgba(var(--accent-rgb),0.4);
   }
   .verify-card h1 {
     font-family: 'Fredoka', sans-serif;
@@ -264,8 +330,8 @@ export function portalCss(): string {
     display: none;
     margin-top: 1.1rem;
     color: var(--text);
-    background: rgba(244,163,64,0.12);
-    border: 1px solid rgba(244,163,64,0.4);
+    background: rgba(var(--accent-rgb),0.12);
+    border: 1px solid rgba(var(--accent-rgb),0.4);
     border-radius: 12px;
     padding: 0.7rem 0.9rem;
     font-size: 0.85rem;
@@ -289,7 +355,7 @@ export function portalCss(): string {
     line-height: 1;
   }
   .result-badge.ok { background: rgba(74,176,108,0.15); color: #4ab06c; border: 2px solid #4ab06c; }
-  .result-badge.bad { background: rgba(244,163,64,0.15); color: var(--accent-bright); border: 2px solid var(--accent); }
+  .result-badge.bad { background: rgba(var(--accent-rgb),0.15); color: var(--accent-bright); border: 2px solid var(--accent); }
   .result-msg { color: var(--muted); line-height: 1.7; font-size: 1.05rem; }
   .result-link { margin-top: 1.5rem; }
 `;

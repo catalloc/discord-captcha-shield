@@ -15,7 +15,7 @@
  */
 
 import { sqlite } from "https://esm.town/v/std/sqlite";
-import { about, brand, portalCss, rules } from "./theme.ts";
+import { portalCss, type ResolvedTheme, resolveTheme } from "./theme.ts";
 import {
   type ChannelKind,
   getChannel,
@@ -23,6 +23,25 @@ import {
   rememberChannel,
   rememberMessage,
 } from "./store.ts";
+import {
+  ALERTS_TABLE,
+  ensureSchema,
+  LOG_TABLE,
+  STATES_TABLE,
+} from "./schema.ts";
+import { resolveGuildTheme } from "./guilds.ts";
+import {
+  loadGuildConfig,
+  loadSharedEnv,
+  optEnv,
+  seedLegacyGuildFromEnv,
+  type SharedEnv,
+} from "./config.ts";
+import { handleAdminRequest } from "./admin.ts";
+
+/** Brand defaults, used when no specific server is in scope (generic error
+ *  pages, 404s). Per-server pages resolve their own theme. */
+const defaultTheme: ResolvedTheme = resolveTheme();
 
 // ========================================
 // CONSTANTS
@@ -33,9 +52,8 @@ const TURNSTILE_VERIFY_URL =
   "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const STATE_TTL_MS = 10 * 60 * 1000; // verification link valid for 10 minutes
 
-const STATES_TABLE = "captcha_verify_states";
-const LOG_TABLE = "captcha_verify_log";
-const ALERTS_TABLE = "captcha_verify_alerts";
+// Table names + schema/migrations live in ./schema.ts (STATES_TABLE,
+// LOG_TABLE, ALERTS_TABLE are imported above).
 
 // Raid detection: alert when an abnormal number of *successful* verifications
 // land within a short window (the pattern Turnstile can't catch — farmed
@@ -86,54 +104,14 @@ interface DiscordUser {
   username?: string;
 }
 
-/** Display name for this deployment: env override, else the brand default. */
-function displayName(config: VerifyConfig): string {
-  return config.serverName ?? brand.name;
-}
-
 // ========================================
 // DATABASE
 // ========================================
 
-let tablesInitialized = false;
-
+/** Ensure all tables/migrations exist. Delegates to the centralized,
+ *  memoized schema module so every query can call it cheaply. */
 async function ensureTables(): Promise<void> {
-  if (tablesInitialized) return;
-
-  await sqlite.execute(`
-    CREATE TABLE IF NOT EXISTS ${STATES_TABLE} (
-      state TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL,
-      used INTEGER NOT NULL DEFAULT 0
-    )
-  `);
-
-  await sqlite.execute(`
-    CREATE TABLE IF NOT EXISTS ${LOG_TABLE} (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      discord_user_id TEXT NOT NULL,
-      discord_username TEXT,
-      created_at INTEGER NOT NULL,
-      success INTEGER NOT NULL,
-      detail TEXT
-    )
-  `);
-
-  // Keeps the raid-detection COUNT (success + recent window) an index seek.
-  await sqlite.execute(`
-    CREATE INDEX IF NOT EXISTS idx_${LOG_TABLE}_success_created
-    ON ${LOG_TABLE} (success, created_at)
-  `);
-
-  // Debounce state for alerts (one row per alert kind).
-  await sqlite.execute(`
-    CREATE TABLE IF NOT EXISTS ${ALERTS_TABLE} (
-      kind TEXT PRIMARY KEY,
-      last_alert_at INTEGER NOT NULL
-    )
-  `);
-
-  tablesInitialized = true;
+  await ensureSchema();
 }
 
 /** Delete used or expired nonces. Cheap because the table only ever holds
@@ -149,23 +127,27 @@ async function pruneStates(): Promise<void> {
   }
 }
 
-/** Mint a one-time state nonce. Only called after Turnstile has passed. */
-async function mintState(): Promise<string> {
+/** Mint a one-time state nonce bound to a guild. Only called after Turnstile
+ *  has passed. The guild is recovered from the nonce on callback. */
+async function mintState(guildId: string): Promise<string> {
   await ensureTables();
   await pruneStates();
   const state = crypto.randomUUID();
   await sqlite.execute({
     sql:
-      `INSERT INTO ${STATES_TABLE} (state, created_at, used) VALUES (?, ?, 0)`,
-    args: [state, Date.now()],
+      `INSERT INTO ${STATES_TABLE} (state, guild_id, created_at, used) VALUES (?, ?, ?, 0)`,
+    args: [state, guildId, Date.now()],
   });
   return state;
 }
 
-/** Validate and atomically burn a state nonce. Returns a reason on failure. */
+/** Validate and atomically burn a state nonce, returning the guild it was
+ *  bound to. Returns a reason on failure. */
 async function consumeState(
   state: string,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
+): Promise<
+  { ok: true; guildId: string | null } | { ok: false; reason: string }
+> {
   await ensureTables();
   const now = Date.now();
 
@@ -178,7 +160,13 @@ async function consumeState(
     args: [state, now - STATE_TTL_MS],
   });
   if ((burn.rowsAffected || 0) === 1) {
-    return { ok: true };
+    // The row we just burned still exists (used = 1); read its guild binding.
+    const res = await sqlite.execute({
+      sql: `SELECT guild_id FROM ${STATES_TABLE} WHERE state = ?`,
+      args: [state],
+    });
+    const raw = res.rows?.[0]?.[0];
+    return { ok: true, guildId: raw == null ? null : String(raw) };
   }
 
   // The burn didn't take — figure out why for a helpful message (rare path).
@@ -196,6 +184,7 @@ async function consumeState(
 }
 
 async function logVerification(
+  guildId: string,
   user: DiscordUser,
   success: boolean,
   detail: string,
@@ -204,8 +193,15 @@ async function logVerification(
     await ensureTables();
     await sqlite.execute({
       sql:
-        `INSERT INTO ${LOG_TABLE} (discord_user_id, discord_username, created_at, success, detail) VALUES (?, ?, ?, ?, ?)`,
-      args: [user.id, user.username ?? null, Date.now(), success ? 1 : 0, detail],
+        `INSERT INTO ${LOG_TABLE} (guild_id, discord_user_id, discord_username, created_at, success, detail) VALUES (?, ?, ?, ?, ?, ?)`,
+      args: [
+        guildId,
+        user.id,
+        user.username ?? null,
+        Date.now(),
+        success ? 1 : 0,
+        detail,
+      ],
     });
   } catch {
     // logging is best-effort
@@ -320,18 +316,21 @@ async function grantRole(
  */
 async function maybeAlertRaid(
   config: VerifyConfig,
-  serverName: string,
+  theme: ResolvedTheme,
 ): Promise<void> {
   if (!config.alertWebhookUrl) return;
   const threshold = config.raidThreshold ?? DEFAULT_RAID_THRESHOLD;
   const windowMs = config.raidWindowMs ?? DEFAULT_RAID_WINDOW_MS;
   const cooldownMs = config.alertCooldownMs ?? DEFAULT_ALERT_COOLDOWN_MS;
+  // One debounce row per server; the guild is namespaced into the alert kind so
+  // each tenant alerts (and cools down) independently.
+  const kind = `raid:${config.guildId}`;
   try {
     const now = Date.now();
     const countRes = await sqlite.execute({
       sql:
-        `SELECT COUNT(*) FROM ${LOG_TABLE} WHERE success = 1 AND created_at > ?`,
-      args: [now - windowMs],
+        `SELECT COUNT(*) FROM ${LOG_TABLE} WHERE guild_id = ? AND success = 1 AND created_at > ?`,
+      args: [config.guildId, now - windowMs],
     });
     const count = Number(countRes.rows?.[0]?.[0] ?? 0);
     if (count < threshold) return;
@@ -340,17 +339,23 @@ async function maybeAlertRaid(
     // last_alert_at past the cooldown actually sends.
     await sqlite.execute({
       sql:
-        `INSERT OR IGNORE INTO ${ALERTS_TABLE} (kind, last_alert_at) VALUES ('raid', 0)`,
-      args: [],
+        `INSERT OR IGNORE INTO ${ALERTS_TABLE} (kind, last_alert_at) VALUES (?, 0)`,
+      args: [kind],
     });
     const claimed = await sqlite.execute({
       sql:
-        `UPDATE ${ALERTS_TABLE} SET last_alert_at = ? WHERE kind = 'raid' AND last_alert_at < ?`,
-      args: [now, now - cooldownMs],
+        `UPDATE ${ALERTS_TABLE} SET last_alert_at = ? WHERE kind = ? AND last_alert_at < ?`,
+      args: [now, kind, now - cooldownMs],
     });
     if ((claimed.rowsAffected || 0) !== 1) return;
 
-    await sendDiscordAlert(config.alertWebhookUrl, serverName, count, windowMs, threshold);
+    await sendDiscordAlert(
+      config.alertWebhookUrl,
+      theme,
+      count,
+      windowMs,
+      threshold,
+    );
   } catch {
     // alerting is best-effort
   }
@@ -358,7 +363,7 @@ async function maybeAlertRaid(
 
 async function sendDiscordAlert(
   webhookUrl: string,
-  serverName: string,
+  theme: ResolvedTheme,
   count: number,
   windowMs: number,
   threshold: number,
@@ -373,8 +378,8 @@ async function sendDiscordAlert(
       embeds: [{
         title: "⚠️ Possible verification raid",
         description:
-          `**${count}** accounts verified in the last **${windowMin} min** on **${serverName}** — above the alert threshold of ${threshold}. This may be a coordinated raid using farmed accounts (Turnstile can't catch those). Consider pausing verification or tightening server join settings.`,
-        color: brand.embedColor,
+          `**${count}** accounts verified in the last **${windowMin} min** on **${theme.name}** — above the alert threshold of ${threshold}. This may be a coordinated raid using farmed accounts (Turnstile can't catch those). Consider pausing verification or tightening server join settings.`,
+        color: theme.embedColor,
         timestamp: new Date().toISOString(),
       }],
     }),
@@ -404,7 +409,8 @@ export async function postVerifyMessage(
       detail: "Set VERIFY_PORTAL_URL (or VERIFY_REDIRECT_URI) to the portal URL.",
     };
   }
-  const serverName = displayName(config);
+  const theme = await resolveGuildTheme(config.guildId);
+  const serverName = theme.name;
   const base = config.portalUrl.replace(/\/+$/, "");
 
   const payload = {
@@ -412,7 +418,7 @@ export async function postVerifyMessage(
       title: "Server Verification",
       description:
         `Welcome to **${serverName}**! To keep the community safe from bots and raids, new members verify before getting access.\n\nClick **Verify** below, complete a quick CAPTCHA, and your role is granted automatically.`,
-      color: brand.embedColor,
+      color: theme.embedColor,
       image: { url: `${base}/og.png` },
     }],
     components: [{
@@ -443,16 +449,17 @@ export async function postRulesMessage(
     };
   }
 
-  const serverName = displayName(config);
+  const theme = await resolveGuildTheme(config.guildId);
+  const serverName = theme.name;
 
   const payload = {
     embeds: [{
       title: "Discord Rules",
       description:
         "Our hope is that we rarely need to enforce these, but it's to everyone's benefit to be clear about who we are and what we expect. The mod team will enforce these rules as necessary.",
-      color: brand.embedColor,
-      thumbnail: { url: brand.logoUrl },
-      fields: rules,
+      color: theme.embedColor,
+      thumbnail: { url: theme.logoUrl },
+      fields: theme.rules,
       footer: { text: serverName },
     }],
     allowed_mentions: { parse: [] },
@@ -481,7 +488,8 @@ export async function postAboutMessage(
         "No about channel. Run setup.ts to create the DMZ channels, or set DISCORD_ABOUT_CHANNEL_ID (numeric ID, link, or #mention).",
     };
   }
-  const serverName = displayName(config);
+  const theme = await resolveGuildTheme(config.guildId);
+  const serverName = theme.name;
   const verifyId = await resolveChannel("verify", config);
   const rulesId = await resolveChannel("rules", config);
 
@@ -491,16 +499,16 @@ export async function postAboutMessage(
   if (verifyId) pointers.push(`Ready? Verify in <#${verifyId}> to unlock the server.`);
   if (rulesId) pointers.push(`Read the rules in <#${rulesId}> first.`);
 
-  const fields = [...about.highlights];
+  const fields = [...theme.about.highlights];
   if (pointers.length) {
     fields.push({ name: "👉 Getting in", value: pointers.join("\n") });
   }
 
   const embed: Record<string, unknown> = {
     title: `About ${serverName}`,
-    description: `*${about.tagline}*\n\n${about.description}`,
-    color: brand.embedColor,
-    thumbnail: { url: brand.logoUrl },
+    description: `*${theme.about.tagline}*\n\n${theme.about.description}`,
+    color: theme.embedColor,
+    thumbnail: { url: theme.logoUrl },
     fields,
     footer: { text: serverName },
   };
@@ -574,7 +582,7 @@ export async function resolveChannel(
 ): Promise<string> {
   const direct = parseChannelId(explicit);
   if (direct) return direct;
-  const stored = await getChannel(kind);
+  const stored = await getChannel(config.guildId, kind);
   if (stored) return stored;
   return parseChannelId(channelEnvField(config, kind));
 }
@@ -598,7 +606,7 @@ async function upsertMessage(
     "content-type": "application/json",
   };
   const targetId = opts.messageId ??
-    (opts.forceNew ? undefined : await getMessage(kind));
+    (opts.forceNew ? undefined : await getMessage(config.guildId, kind));
 
   if (targetId) {
     const res = await fetch(
@@ -606,8 +614,8 @@ async function upsertMessage(
       { method: "PATCH", headers, body: JSON.stringify(payload) },
     );
     if (res.ok) {
-      await rememberMessage(kind, targetId);
-      await rememberChannel(kind, channelId);
+      await rememberMessage(config.guildId, kind, targetId);
+      await rememberChannel(config.guildId, kind, channelId);
       return {
         ok: true,
         detail: `updated message ${targetId} in channel ${channelId}`,
@@ -629,8 +637,8 @@ async function upsertMessage(
   );
   if (res.ok) {
     const msg = await res.json().catch(() => ({} as { id?: string }));
-    if (msg?.id) await rememberMessage(kind, String(msg.id));
-    await rememberChannel(kind, channelId);
+    if (msg?.id) await rememberMessage(config.guildId, kind, String(msg.id));
+    await rememberChannel(config.guildId, kind, channelId);
     return {
       ok: true,
       detail: `posted to channel ${channelId}${msg?.id ? ` (message ${msg.id})` : ""}`,
@@ -662,9 +670,10 @@ export async function postHoneypotMessage(
         "No honeypot channel. Run setup.ts to create the DMZ channels, or set DISCORD_HONEYPOT_CHANNEL_ID (numeric ID, link, or #mention).",
     };
   }
+  const theme = await resolveGuildTheme(config.guildId);
   const verifyId = await resolveChannel("verify", config);
   const rulesId = await resolveChannel("rules", config);
-  const serverName = displayName(config);
+  const serverName = theme.name;
 
   const lines = ["**Please do not post in this channel.**", ""];
   lines.push(
@@ -679,7 +688,7 @@ export async function postHoneypotMessage(
     embeds: [{
       title: "Do Not Post In This Channel",
       description: lines.join("\n"),
-      color: brand.embedColor,
+      color: theme.embedColor,
       footer: { text: serverName },
     }],
     allowed_mentions: { parse: [] },
@@ -704,7 +713,12 @@ function escapeHtml(s: string): string {
 const DISCORD_GLYPH =
   `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 4.4A19.8 19.8 0 0 0 15.4 3l-.3.5a14 14 0 0 1 4.3 1.4A13.6 13.6 0 0 0 4.6 4.9 13.7 13.7 0 0 1 8.9 3.5L8.6 3a19.8 19.8 0 0 0-4.9 1.4C1.1 8.3.5 12.1.7 15.8a19.9 19.9 0 0 0 6 3l.8-1.1c-1-.4-2-.9-2.8-1.5l.7-.5a14.2 14.2 0 0 0 12.2 0l.7.5c-.9.6-1.8 1.1-2.8 1.5l.8 1.1a19.8 19.8 0 0 0 6-3c.3-4.3-.7-8.1-2.8-11.4ZM9 13.9c-1 0-1.7-.9-1.7-1.9 0-1 .8-1.9 1.7-1.9 1 0 1.8.9 1.7 1.9 0 1-.8 1.9-1.7 1.9Zm6 0c-1 0-1.7-.9-1.7-1.9 0-1 .8-1.9 1.7-1.9 1 0 1.8.9 1.7 1.9 0 1-.8 1.9-1.7 1.9Z"/></svg>`;
 
-function shell(name: string, innerHtml: string, ogImage: string): string {
+function shell(
+  theme: ResolvedTheme,
+  innerHtml: string,
+  ogImage: string,
+): string {
+  const name = theme.name;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -724,7 +738,7 @@ function shell(name: string, innerHtml: string, ogImage: string): string {
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600&family=Quicksand:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <style>${portalCss()}</style>
+  <style>${portalCss(theme)}</style>
 </head>
 <body>
   <main class="verify-wrap">
@@ -736,17 +750,24 @@ function shell(name: string, innerHtml: string, ogImage: string): string {
 </html>`;
 }
 
-// The portal page is identical for every visitor (depends only on static
-// config), so build it once per config and reuse the string.
+// The portal page is identical for every visitor of a given server (depends
+// only on that server's static config + theme), so build it once per
+// (guild, theme, og) key and reuse the string.
 const portalPageCache = new Map<string, string>();
 
-export function renderPortalPage(config: VerifyConfig, ogImage: string): string {
-  const serverName = displayName(config);
-  const cacheKey = `${config.turnstileSiteKey}|${serverName}|${ogImage}`;
+export function renderPortalPage(
+  config: VerifyConfig,
+  theme: ResolvedTheme,
+  ogImage: string,
+): string {
+  const serverName = theme.name;
+  const startPath = `/g/${config.guildId}/start`;
+  const cacheKey =
+    `${config.guildId}|${config.turnstileSiteKey}|${serverName}|${theme.logoUrl}|${theme.accentColor}|${ogImage}`;
   const cached = portalPageCache.get(cacheKey);
   if (cached) return cached;
   const inner = `
-    <img class="verify-logo" src="${escapeHtml(brand.logoUrl)}" alt="${escapeHtml(serverName)}" />
+    <img class="verify-logo" src="${escapeHtml(theme.logoUrl)}" alt="${escapeHtml(serverName)}" />
     <h1>Are you human?</h1>
     <p class="verify-sub">${escapeHtml(serverName)} · Access Check</p>
     <ul class="verify-steps">
@@ -783,7 +804,7 @@ export function renderPortalPage(config: VerifyConfig, ogImage: string): string 
         btn.disabled = true;
         label.textContent = 'Connecting to Discord...';
         try {
-          var res = await fetch('/start', {
+          var res = await fetch(${JSON.stringify(startPath)}, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ token: captchaToken })
@@ -800,18 +821,23 @@ export function renderPortalPage(config: VerifyConfig, ogImage: string): string 
         }
       });
     </script>`;
-  const html = shell(serverName, inner, ogImage);
+  const html = shell(theme, inner, ogImage);
   portalPageCache.set(cacheKey, html);
   return html;
 }
 
-export function renderResultPage(success: boolean, message: string): string {
+export function renderResultPage(
+  theme: ResolvedTheme,
+  success: boolean,
+  message: string,
+  restartHref = "/",
+): string {
   const inner = `
     <div class="result-badge ${success ? "ok" : "bad"}">${success ? "&#10003;" : "&#10005;"}</div>
     <h1>${success ? "Verified" : "Verification failed"}</h1>
     <p class="result-msg">${escapeHtml(message)}</p>
-    ${success ? "" : `<div class="result-link"><a class="btn btn-secondary btn-block" href="/">Start Over</a></div>`}`;
-  return shell(brand.name, inner, brand.ogFallbackImage);
+    ${success ? "" : `<div class="result-link"><a class="btn btn-secondary btn-block" href="${escapeHtml(restartHref)}">Start Over</a></div>`}`;
+  return shell(theme, inner, theme.ogFallbackImage);
 }
 
 // ========================================
@@ -865,7 +891,7 @@ async function handleStart(
     return jsonResponse({ error: "CAPTCHA check failed. Please try again." }, 400);
   }
 
-  const state = await mintState();
+  const state = await mintState(config.guildId);
   const authUrl = new URL("https://discord.com/oauth2/authorize");
   authUrl.searchParams.set("client_id", config.clientId);
   authUrl.searchParams.set("redirect_uri", redirectUriFor(config, url));
@@ -877,44 +903,63 @@ async function handleStart(
   return jsonResponse({ url: authUrl.toString() });
 }
 
+/**
+ * OAuth callback — a single shared redirect URI for every server. The guild is
+ * recovered from the state nonce (not the URL), so one registered redirect URI
+ * serves unlimited servers. Loads that server's config + theme, then grants.
+ */
 async function handleCallback(
   url: URL,
-  config: VerifyConfig,
+  shared: SharedEnv,
 ): Promise<Response> {
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
   const oauthError = url.searchParams.get("error");
 
   if (oauthError) {
-    return htmlResponse(renderResultPage(false, "Discord authorization was cancelled."));
+    return htmlResponse(renderResultPage(defaultTheme, false, "Discord authorization was cancelled."));
   }
   if (!code || !state) {
-    return htmlResponse(renderResultPage(false, "Missing authorization data. Please start over."));
+    return htmlResponse(renderResultPage(defaultTheme, false, "Missing authorization data. Please start over."));
   }
 
   const consumed = await consumeState(state);
   if (!consumed.ok) {
-    return htmlResponse(renderResultPage(false, consumed.reason));
+    return htmlResponse(renderResultPage(defaultTheme, false, consumed.reason));
   }
+
+  // Recover the server this nonce was minted for. Legacy nonces (pre-migration,
+  // guild_id NULL) fall back to the single guild named in env.
+  const guildId = consumed.guildId ?? optEnv("DISCORD_GUILD_ID");
+  if (!guildId) {
+    return htmlResponse(renderResultPage(defaultTheme, false, "Invalid session. Please start over."));
+  }
+  const config = await loadGuildConfig(guildId, shared);
+  if (!config) {
+    return htmlResponse(renderResultPage(defaultTheme, false, "This server is no longer active. Please contact a moderator."));
+  }
+  const theme = await resolveGuildTheme(guildId);
+  const restart = `/g/${guildId}`;
 
   const accessToken = await exchangeCode(config, code, redirectUriFor(config, url));
   if (!accessToken) {
-    return htmlResponse(renderResultPage(false, "Could not authenticate with Discord. Please start over."));
+    return htmlResponse(renderResultPage(theme, false, "Could not authenticate with Discord. Please start over.", restart));
   }
 
   const user = await fetchDiscordUser(accessToken);
   if (!user) {
-    return htmlResponse(renderResultPage(false, "Could not read your Discord profile. Please start over."));
+    return htmlResponse(renderResultPage(theme, false, "Could not read your Discord profile. Please start over.", restart));
   }
 
   const { status, body, code: errorCode } = await grantRole(config, user.id);
 
   if (status === 204) {
-    await logVerification(user, true, "role granted");
-    await maybeAlertRaid(config, displayName(config));
+    await logVerification(guildId, user, true, "role granted");
+    await maybeAlertRaid(config, theme);
     const name = user.username ? `, ${user.username}` : "";
     return htmlResponse(
       renderResultPage(
+        theme,
         true,
         `You're all set${name}! Head back to Discord — your verified role has been granted. You can close this tab.`,
       ),
@@ -925,6 +970,7 @@ async function handleCallback(
   // 10004 Unknown Guild, 10007 Unknown Member, 10011 Unknown Role,
   // 50013 Missing Permissions, 50001 Missing Access).
   await logVerification(
+    guildId,
     user,
     false,
     `role grant failed: status=${status} code=${errorCode ?? "?"} body=${body.slice(0, 400)}`,
@@ -933,7 +979,7 @@ async function handleCallback(
   // Only a genuine "Unknown Member" means the user must join first.
   if (status === 404 && errorCode === 10007) {
     return htmlResponse(
-      renderResultPage(false, "You're not in the server yet. Join the Discord first, then come back and verify."),
+      renderResultPage(theme, false, "You're not in the server yet. Join the Discord first, then come back and verify.", restart),
     );
   }
   // Everything else is a server-side configuration problem.
@@ -945,64 +991,144 @@ async function handleCallback(
   } else if (status === 403 || errorCode === 50013 || errorCode === 50001) {
     adminMessage = "The bot doesn't have permission to grant the role (check its permissions and role position). Please contact a moderator.";
   }
-  return htmlResponse(renderResultPage(false, adminMessage));
+  return htmlResponse(renderResultPage(theme, false, adminMessage, restart));
+}
+
+/** Serve a server's portal page (per-server branding + Turnstile). */
+async function handlePortal(
+  url: URL,
+  guildId: string,
+  shared: SharedEnv,
+): Promise<Response> {
+  const config = await loadGuildConfig(guildId, shared);
+  if (!config) {
+    return htmlResponse(
+      renderResultPage(defaultTheme, false, "This verification link isn't active.", "/"),
+      404,
+    );
+  }
+  const theme = await resolveGuildTheme(guildId);
+  const ogImage = `${url.origin}/g/${guildId}/og.png`;
+  return new Response(renderPortalPage(config, theme, ogImage), {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+    },
+  });
+}
+
+/** Serve a server's cached OG card, or redirect to its fallback image. */
+async function handleOgImage(guildId: string): Promise<Response> {
+  try {
+    const { readVerifyOgImage } = await import("./og.ts");
+    const png = await readVerifyOgImage(guildId);
+    if (png) {
+      // A Uint8Array is a valid BodyInit at runtime; the cast satisfies the
+      // DOM lib's narrower BufferSource typing.
+      return new Response(png as BodyInit, {
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "cache-control": "public, max-age=86400, immutable",
+        },
+      });
+    }
+  } catch (e) {
+    console.error("og read failed:", e);
+  }
+  // Not generated yet (the cron builds it) — fall back to the theme image.
+  const theme = await resolveGuildTheme(guildId);
+  return new Response(null, {
+    status: 302,
+    headers: { location: theme.ogFallbackImage },
+  });
 }
 
 // ========================================
 // PUBLIC ENTRY POINT
 // ========================================
 
-export async function handleVerifyRequest(
-  req: Request,
-  config: VerifyConfig,
-): Promise<Response> {
+let migrationRan = false;
+
+/** Run the legacy single-guild migration once per isolate (cheap no-op after
+ *  the row exists). Keeps an upgraded deployment serving its existing server. */
+async function ensureMigration(): Promise<void> {
+  if (migrationRan) return;
+  migrationRan = true;
+  try {
+    await seedLegacyGuildFromEnv();
+  } catch (e) {
+    console.error("legacy guild seed failed:", e);
+  }
+}
+
+/**
+ * Multi-tenant router. Per-server pages live under /g/{guildId}; the OAuth
+ * callback is a single shared route that recovers its server from the state
+ * nonce. Config + branding are loaded per request from SQLite.
+ *
+ *   GET  /                     -> redirect to the legacy server, if env-named
+ *   GET  /g/{guildId}          -> portal page
+ *   GET  /g/{guildId}/og.png   -> social card
+ *   POST /g/{guildId}/start    -> verify Turnstile, mint state, return OAuth URL
+ *   GET  /callback             -> validate state, grant the verified role
+ */
+export async function handleVerifyRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
   try {
+    const shared = loadSharedEnv();
+    await ensureMigration();
+
     if (req.method === "GET" && url.pathname === "/") {
-      return new Response(renderPortalPage(config, `${url.origin}/og.png`), {
-        status: 200,
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "public, max-age=3600",
-        },
-      });
-    }
-    if (req.method === "GET" && url.pathname === "/og.png") {
-      try {
-        const { readVerifyOgImage } = await import("./og.ts");
-        const png = await readVerifyOgImage();
-        if (png) {
-          // A Uint8Array is a valid BodyInit at runtime; the cast satisfies the
-          // DOM lib's narrower BufferSource typing.
-          return new Response(png as BodyInit, {
-            status: 200,
-            headers: {
-              "content-type": "image/png",
-              "cache-control": "public, max-age=86400, immutable",
-            },
-          });
-        }
-      } catch (e) {
-        console.error("og read failed:", e);
+      const legacy = optEnv("DISCORD_GUILD_ID");
+      if (legacy) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: `/g/${legacy}` },
+        });
       }
-      // Not generated yet (the cron builds it) — fall back to the brand image.
-      return new Response(null, {
-        status: 302,
-        headers: { location: brand.ogFallbackImage },
-      });
+      return htmlResponse(
+        renderResultPage(defaultTheme, false, "No server specified."),
+        404,
+      );
     }
-    if (req.method === "POST" && url.pathname === "/start") {
-      return await handleStart(req, url, config);
-    }
+
+    // Guarded admin API (/admin/*). Returns null when not an admin path.
+    const adminRes = await handleAdminRequest(req, url, shared.adminSecret);
+    if (adminRes) return adminRes;
+
+    // Shared OAuth callback (guild recovered from the state nonce).
     if (req.method === "GET" && url.pathname === "/callback") {
-      return await handleCallback(url, config);
+      return await handleCallback(url, shared);
     }
-    return htmlResponse(renderResultPage(false, "Page not found."), 404);
+
+    // Per-server routes: /g/{guildId}[/start|/og.png]
+    const m = url.pathname.match(/^\/g\/(\d+)(\/[a-z.]+)?$/);
+    if (m) {
+      const guildId = m[1];
+      const sub = m[2] ?? "";
+      if (req.method === "GET" && sub === "") {
+        return await handlePortal(url, guildId, shared);
+      }
+      if (req.method === "GET" && sub === "/og.png") {
+        return await handleOgImage(guildId);
+      }
+      if (req.method === "POST" && sub === "/start") {
+        const config = await loadGuildConfig(guildId, shared);
+        if (!config) {
+          return jsonResponse({ error: "Unknown or disabled server." }, 404);
+        }
+        return await handleStart(req, url, config);
+      }
+    }
+
+    return htmlResponse(renderResultPage(defaultTheme, false, "Page not found."), 404);
   } catch (e) {
     console.error("verify error:", e);
     return htmlResponse(
-      renderResultPage(false, "Something went wrong on our end. Please try again later."),
+      renderResultPage(defaultTheme, false, "Something went wrong on our end. Please try again later."),
       500,
     );
   }

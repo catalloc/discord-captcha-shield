@@ -67,7 +67,9 @@ Only two things meaningfully limit a joined-but-unverified user:
 ## A quick win available now
 
 On successful verify, also **remove** an "Unverified"/"Quarantine" role (not just
-add Verified): add a `DISCORD_UNVERIFIED_ROLE_ID` env var and a `DELETE
-/guilds/{guild}/members/{user}/roles/{roleId}` call on success in `mod.ts`.
-(Auto-*assigning* that role on join still needs a gateway bot or an Onboarding
-default role.)
+add Verified): add an `unverifiedRoleId` field to the per-server config (a column
+in `captcha_guilds` + the admin API, alongside `roleId`) and a `DELETE
+/guilds/{guild}/members/{user}/roles/{roleId}` call on success in `mod.ts`. Keep
+it per-server, not an env var, so each shielded server can use its own quarantine
+role. (Auto-*assigning* that role on join still needs a gateway bot or an
+Onboarding default role.)

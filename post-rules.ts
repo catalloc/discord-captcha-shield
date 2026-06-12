@@ -2,24 +2,24 @@
 // Post the server rules into Discord (manual trigger)
 // ============================================================================
 //
-// Run this file (Val Town "Run" button) and the bot posts the rules (from
-// theme.ts) as a branded embed into DISCORD_RULES_CHANNEL_ID. Post it once.
+// Run this file and the bot posts the server's rules as a branded embed into
+// its rules channel. Post it once.
 //
-// Requires: DISCORD_BOT_TOKEN, DISCORD_RULES_CHANNEL_ID (numeric ID, channel
-// link, or #mention all accepted). Optional: VERIFY_SERVER_NAME (footer).
-// The bot needs Send Messages + Embed Links in that channel.
+// Which server: pass the guild id as the first CLI argument, or set
+// TOOL_GUILD_ID / DISCORD_GUILD_ID. The rules channel + branding (including the
+// rules list) come from the registered server's config; the bot token is shared
+// env. The bot needs Send Messages + Embed Links in that channel.
 // ============================================================================
 
-import { postRulesMessage, type VerifyConfig } from "./mod.ts";
-import { env, optEnv } from "./config.ts";
+import { postRulesMessage } from "./mod.ts";
+import { loadGuildToolConfig, toolGuildId } from "./config.ts";
 
-export async function main() {
-  const config = {
-    botToken: env("DISCORD_BOT_TOKEN"),
-    serverName: optEnv("VERIFY_SERVER_NAME"),
-    rulesChannelId: optEnv("DISCORD_RULES_CHANNEL_ID"),
-  } as VerifyConfig;
-
+export async function main(guildId: string = toolGuildId()) {
+  const config = await loadGuildToolConfig(guildId);
+  if (!config) {
+    console.error(`Server ${guildId} isn't registered (POST /admin/guilds first).`);
+    return;
+  }
   const result = await postRulesMessage(config);
   console.log(
     result.ok

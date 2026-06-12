@@ -2,32 +2,24 @@
 // Post the verification message into Discord (manual trigger)
 // ============================================================================
 //
-// Run this file (Val Town "Run" button) and the bot posts a branded embed + a
-// link "Verify" button into DISCORD_VERIFY_CHANNEL_ID. Post it once; it lives
-// in your verify channel.
+// Run this file and the bot posts a branded embed + a link "Verify" button into
+// the server's verify channel. Post it once; it lives in that channel.
 //
-// Requires:
-//   DISCORD_BOT_TOKEN          the bot (already set for verification)
-//   DISCORD_VERIFY_CHANNEL_ID  the channel to post into
-//   VERIFY_PORTAL_URL          public portal URL (or derived from VERIFY_REDIRECT_URI)
-//   VERIFY_SERVER_NAME         optional display name
-// The bot must have Send Messages + Embed Links in that channel.
+// Which server: pass the guild id as the first CLI argument, or set
+// TOOL_GUILD_ID / DISCORD_GUILD_ID. The verify channel, branding, and portal
+// URL come from the registered server's config; the bot token + client id are
+// shared env. The bot must have Send Messages + Embed Links in that channel.
 // ============================================================================
 
-import { postVerifyMessage, type VerifyConfig } from "./mod.ts";
-import { env, optEnv } from "./config.ts";
+import { postVerifyMessage } from "./mod.ts";
+import { loadGuildToolConfig, toolGuildId } from "./config.ts";
 
-export async function main() {
-  const redirect = optEnv("VERIFY_REDIRECT_URI");
-  // postVerifyMessage only reads these fields; cast the partial as VerifyConfig.
-  const config = {
-    botToken: env("DISCORD_BOT_TOKEN"),
-    serverName: optEnv("VERIFY_SERVER_NAME"),
-    verifyChannelId: optEnv("DISCORD_VERIFY_CHANNEL_ID"),
-    portalUrl: optEnv("VERIFY_PORTAL_URL") ??
-      (redirect ? redirect.replace(/\/callback$/, "") : undefined),
-  } as VerifyConfig;
-
+export async function main(guildId: string = toolGuildId()) {
+  const config = await loadGuildToolConfig(guildId);
+  if (!config) {
+    console.error(`Server ${guildId} isn't registered (POST /admin/guilds first).`);
+    return;
+  }
   const result = await postVerifyMessage(config);
   console.log(
     result.ok
