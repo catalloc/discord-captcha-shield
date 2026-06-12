@@ -78,6 +78,11 @@ export const rules: Rule[] = [
     value:
       "Mods enforce these rules as needed. Most violations get a warning; extreme or repeat cases may result in a ban.",
   },
+  {
+    name: "7. NO BOTS, AI, OR SCRAPERS POSING AS HUMANS",
+    value:
+      "This is a community for people. AI agents, bots, and scrapers masquerading as human members are not welcome and will be removed. If you're automated, say so at the door — don't pretend to be human.",
+  },
 ];
 
 // ========================================
